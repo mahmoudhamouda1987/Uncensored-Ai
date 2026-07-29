@@ -139,17 +139,6 @@ export default function Home() {
         });
       }
 
-      // Mark done — trim to last complete sentence if cut off at token limit
-      const sentenceEnd = /[.!?。！？]/;
-      if (!sentenceEnd.test(fullText.slice(-1))) {
-        const lastPunct = Math.max(
-          fullText.lastIndexOf('.'),
-          fullText.lastIndexOf('!'),
-          fullText.lastIndexOf('?')
-        );
-        if (lastPunct !== -1) fullText = fullText.substring(0, lastPunct + 1);
-      }
-
       setMessages((prev) => {
         const updated = [...prev];
         updated[updated.length - 1] = {
