@@ -16,6 +16,7 @@ import { Turnstile } from '@marsidev/react-turnstile';
 const FONT_SIZES = { small: "13px", medium: "15px", large: "17px" };
 
 export default function Home() {
+  const SESSION_VERIFIED_KEY = "gptoss_turnstile_verified";
   const [userInput, setUserInput] = useState("");
   const [messages, setMessages] = useState([]);
   const [hasInteracted, setHasInteracted] = useState(false);
@@ -25,7 +26,7 @@ export default function Home() {
   const [scanPhase, setScanPhase] = useState("idle");
   const [turnstileToken, setTurnstileToken] = useState("");
   const turnstileRef = useRef(null);
-  // Once the backend issues a session cookie, we stop sending the Turnstile token
+  // Keep verification scoped to the current tab only.
   const isSessionVerified = useRef(false);
 
   // ─── Settings state ───
@@ -44,6 +45,9 @@ export default function Home() {
         localStorage.setItem("userId", storedUserId);
       }
       setUserId(storedUserId);
+
+      const verified = sessionStorage.getItem(SESSION_VERIFIED_KEY) === "1";
+      isSessionVerified.current = verified;
 
       // Load saved settings
       const saved = localStorage.getItem("gptoss_settings");
@@ -151,8 +155,11 @@ export default function Home() {
       });
       setScanPhase("idle");
       setIsResponding(false);
-      // Mark session as established so we skip Turnstile on future requests
+      // Mark the tab as verified so the widget stays valid until the tab closes.
       isSessionVerified.current = true;
+      if (typeof window !== "undefined") {
+        sessionStorage.setItem(SESSION_VERIFIED_KEY, "1");
+      }
     } catch (error) {
       console.error("Error fetching response:", error);
       setIsResponding(false);
@@ -385,8 +392,8 @@ export default function Home() {
                 </HoverBorderGradient>
               </motion.div>
 
-              {/* Turnstile widget under chat bar */}
-              {process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY && (
+              {/* Single stable Turnstile mount for the whole tab */}
+              {needsVerification && !isSessionVerified.current && (
                 <div className="mt-3 flex justify-center">
                   <Turnstile
                     ref={turnstileRef}
@@ -516,24 +523,13 @@ export default function Home() {
             </button>
           </div>
 
-          {/* ─── Chat Turnstile: hidden widget + inline badge ─── */}
-          {process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY && (
-            <>
-              <div style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', height: 0, overflow: 'hidden' }}>
-                <Turnstile
-                  ref={turnstileRef}
-                  siteKey={process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY}
-                  onSuccess={(token) => setTurnstileToken(token)}
-                  options={{ theme: 'dark' }}
-                />
-              </div>
-              <div className="max-w-3xl mx-auto flex justify-center mt-1.5">
-                <span className="flex items-center gap-1.5 text-[11px] text-gray-600">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.5 6.5l-4 4a.75.75 0 01-1.06 0l-2-2a.75.75 0 111.06-1.06L7 8.94l3.47-3.47a.75.75 0 111.06 1.06z" fill="#f38020" /></svg>
-                  Protected by Cloudflare
-                </span>
-              </div>
-            </>
+          {needsVerification && !isSessionVerified.current && (
+            <div className="max-w-3xl mx-auto flex justify-center mt-1.5">
+              <span className="flex items-center gap-1.5 text-[11px] text-gray-600">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.5 6.5l-4 4a.75.75 0 01-1.06 0l-2-2a.75.75 0 111.06-1.06L7 8.94l3.47-3.47a.75.75 0 111.06 1.06z" fill="#f38020" /></svg>
+                Protected by Cloudflare
+              </span>
+            </div>
           )}
         </div>
       )}
