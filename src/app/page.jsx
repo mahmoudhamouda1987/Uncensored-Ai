@@ -212,8 +212,8 @@ export default function Home() {
 
   const currentFontSize = FONT_SIZES[fontSize] || "15px";
 
-  // Gate: if Turnstile is configured, block until verified
-  const needsVerification = !!process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
+  // Gate only in production so local runs work without Turnstile.
+  const needsVerification = process.env.NODE_ENV === "production" && !!process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
   const isVerified = !needsVerification || !!turnstileToken || isSessionVerified.current;
 
   return (

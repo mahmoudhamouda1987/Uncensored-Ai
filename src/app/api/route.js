@@ -73,6 +73,48 @@ function getRateLimiter() {
     return _ratelimit;
 }
 
+function isLoopbackHost(hostname) {
+    if (!hostname) return false;
+    return hostname === 'localhost'
+        || hostname === '127.0.0.1'
+        || hostname === '::1'
+        || hostname === '[::1]';
+}
+
+function isLocalRequest(request) {
+    const url = new URL(request.url);
+    const hostHeader = request.headers.get('host');
+    const originHeader = request.headers.get('origin');
+    const forwardedHost = request.headers.get('x-forwarded-host');
+
+    const candidates = [url.hostname, hostHeader, forwardedHost]
+        .flatMap((value) => (value ? value.split(',') : []))
+        .map((value) => value.trim())
+        .map((value) => {
+            if (value.startsWith('[')) {
+                return value.slice(1, value.indexOf(']') > -1 ? value.indexOf(']') : undefined);
+            }
+            const lastColon = value.lastIndexOf(':');
+            if (lastColon > -1 && value.indexOf(':') === lastColon) {
+                return value.slice(0, lastColon);
+            }
+            return value;
+        });
+
+    for (const candidate of candidates) {
+        if (isLoopbackHost(candidate)) return true;
+    }
+
+    if (originHeader) {
+        try {
+            const originHost = new URL(originHeader).hostname;
+            if (isLoopbackHost(originHost)) return true;
+        } catch { }
+    }
+
+    return false;
+}
+
 // =========================
 // UNIVERSAL PROMPT
 // =========================
@@ -247,9 +289,9 @@ async function handleRequest(request) {
             let newSessionId = null;
 
             // 1. Session & Turnstile Verification
-            // Skip entirely in development — Turnstile site keys are domain-locked and won't work on localhost
-            const isDev = process.env.NODE_ENV === 'development';
-            if (!isDev && process.env.TURNSTILE_SECRET_KEY) {
+            // Only enforce Turnstile when the request is not coming from loopback.
+            const needsTurnstile = process.env.TURNSTILE_SECRET_KEY && !isLocalRequest(request);
+            if (needsTurnstile) {
                 const cookieStore = await cookies();
                 const sessionId = cookieStore.get('cf_verified')?.value;
                 let isVerified = false;
@@ -327,7 +369,7 @@ async function handleRequest(request) {
                 }
 
                 if (newSessionId) {
-                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${3600 * 24}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${3600 * 24}${isLocalRequest(request) ? '' : '; Secure'}`;
                 }
                 return new Response(readableStream, { status: 200, headers });
             }
