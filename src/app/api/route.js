@@ -13,12 +13,23 @@ import { Redis } from "@upstash/redis";
 // GROQ KEY ROTATION
 // =========================
 function getGroqKeys() {
-    return [
-        process.env.GROQ_API_KEY,
-        process.env.GROQ_API_KEY_2,
-        process.env.GROQ_API_KEY_3,
-    ].filter(Boolean); // remove empty/undefined slots
+    // Load GROQ_API_KEY plus any numbered keys (GROQ_API_KEY_2, _3, ...).
+    // This lets additional accounts be added through environment variables only.
+    return [...new Set(
+        Object.entries(process.env)
+            .filter(([name, value]) => /^GROQ_API_KEY(?:_\d+)?$/.test(name) && value)
+            .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+            .map(([, value]) => value.trim())
+    )];
 }
+
+// Keep one active key for this server process. It only advances after Groq
+// rejects that key with 429, so quota is used in the requested 1 -> 2 -> 3 order.
+const groqRotationState = globalThis.__groqRotationState || {
+    keySignature: '',
+    activeIndex: 0,
+};
+globalThis.__groqRotationState = groqRotationState;
 
 function isRateLimitError(e) {
     // Groq SDK wraps HTTP errors as APIError with .status; also check common message patterns
@@ -30,47 +41,94 @@ function isRateLimitError(e) {
         || e?.message?.toLowerCase().includes('rate_limit');
 }
 
-// Try each Groq key in order; skip to next key on 429
+function isDailyTokenQuotaError(e) {
+    const message = String(e?.message || '').toLowerCase();
+    return isRateLimitError(e)
+        && (message.includes('tokens per day') || message.includes(' tpd') || message.includes('(tpd)'));
+}
+
+// Use the active key until it is limited, then move forward and keep using that next key.
 async function groqCreateWithRotation(params) {
     const keys = getGroqKeys();
     if (keys.length === 0) throw new Error('No Groq API keys configured');
 
+    const keySignature = keys.join('|');
+    if (groqRotationState.keySignature !== keySignature) {
+        groqRotationState.keySignature = keySignature;
+        groqRotationState.activeIndex = 0;
+    }
+
     let lastError = null;
-    for (const key of keys) {
+    const startingIndex = groqRotationState.activeIndex % keys.length;
+    for (let offset = 0; offset < keys.length; offset += 1) {
+        const i = (startingIndex + offset) % keys.length;
+        const key = keys[i];
         // maxRetries: 0 = fail fast on 429 without retrying the same key
         const client = new OpenAI({ apiKey: key, baseURL: 'https://api.groq.com/openai/v1', maxRetries: 0 });
         try {
             // 429 is thrown at .create() time (HTTP error before body) — even with stream:true
-            return await client.chat.completions.create(params);
+            const result = await client.chat.completions.create(params);
+            return { result, keyIndex: i + 1 };
         } catch (e) {
             if (isRateLimitError(e)) {
-                console.warn(`Groq key exhausted (429), rotating to next key...`);
                 lastError = e;
-                continue; // try next key
+                groqRotationState.activeIndex = (i + 1) % keys.length;
+                continue;
             }
             throw e; // non-429 error → propagate immediately
         }
     }
-    // All keys exhausted
     throw lastError;
 }
 
 // =========================
 // SECURITY
 // =========================
-let _ratelimit = null;
-function getRateLimiter() {
-    if (!_ratelimit && process.env.UPSTASH_REDIS_REST_URL) {
-        const redis = new Redis({
+
+// ── Shared Redis client (reused everywhere) ──
+let _redis = null;
+function getRedis() {
+    if (!_redis && process.env.UPSTASH_REDIS_REST_URL) {
+        _redis = new Redis({
             url: process.env.UPSTASH_REDIS_REST_URL,
             token: process.env.UPSTASH_REDIS_REST_TOKEN,
         });
+    }
+    return _redis;
+}
+
+// ── Input limits ──
+const MAX_INPUT_CHARS = 4000;       // max characters for a single prompt
+const MAX_MESSAGES_TOTAL = 12000;   // max total characters across all messages in a conversation
+
+// ── Rate limiter (5 requests / minute per IP) ──
+let _ratelimit = null;
+function getRateLimiter() {
+    if (!_ratelimit && getRedis()) {
         _ratelimit = new Ratelimit({
-            redis: redis,
+            redis: getRedis(),
             limiter: Ratelimit.fixedWindow(5, "1 m"),
         });
     }
     return _ratelimit;
+}
+
+// ── Daily per-IP cap (200 requests/day) ──
+const DAILY_REQUEST_LIMIT = 200;
+const DAILY_REQUEST_WINDOW = 86400; // 24 hours in seconds
+
+async function checkDailyCap(ip) {
+    const redis = getRedis();
+    if (!redis) return { allowed: true };
+    const key = `daily:${ip}`;
+    const count = await redis.incr(key);
+    if (count === 1) {
+        await redis.expire(key, DAILY_REQUEST_WINDOW);
+    }
+    if (count > DAILY_REQUEST_LIMIT) {
+        return { allowed: false, remaining: 0 };
+    }
+    return { allowed: true, remaining: DAILY_REQUEST_LIMIT - count };
 }
 
 function isLoopbackHost(hostname) {
@@ -153,7 +211,7 @@ Return all required files.
 // LLM CALL (CODE)
 // =========================
 async function generateCodeCompletion(messages) {
-    const stream = await groqCreateWithRotation({
+    const { result: stream, keyIndex } = await groqCreateWithRotation({
         model: "openai/gpt-oss-120b",
         messages: messages,
         temperature: 0.2,
@@ -166,7 +224,7 @@ async function generateCodeCompletion(messages) {
     for await (const chunk of stream) {
         text += chunk.choices[0]?.delta?.content || "";
     }
-    return text.trim();
+    return { text: text.trim(), keyIndex };
 }
 
 // =========================
@@ -221,7 +279,7 @@ Response style:
         ...conversationMessages
     ];
 
-    const apiStream = await groqCreateWithRotation({
+    const { result: apiStream, keyIndex } = await groqCreateWithRotation({
         model: "openai/gpt-oss-120b",
         messages,
         temperature: 0.7,
@@ -244,7 +302,7 @@ Response style:
         }
     });
 
-    return readable;
+    return { readable, keyIndex };
 }
 
 
@@ -277,7 +335,7 @@ function formatFiles(text) {
 // PIPELINE
 // =========================
 async function generateCode(input) {
-    const raw = await generateCodeCompletion(buildPrompt(input));
+    const { text: raw } = await generateCodeCompletion(buildPrompt(input));
     return formatFiles(raw);
 }
 
@@ -293,6 +351,14 @@ async function handleRequest(request) {
             const body = await request.json();
             let newSessionId = null;
 
+            // 0. Input validation — reject oversized payloads before hitting the LLM
+            if (body.messages) {
+                const totalChars = body.messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+                if (totalChars > MAX_MESSAGES_TOTAL) {
+                    return new NextResponse("Your conversation is getting long! Try starting a new chat to keep things running smoothly.", { status: 400 });
+                }
+            }
+
             // 1. Session & Turnstile Verification
             // Only enforce Turnstile when the request is not coming from loopback.
             const needsTurnstile = process.env.TURNSTILE_SECRET_KEY && !isLocalRequest(request);
@@ -301,18 +367,17 @@ async function handleRequest(request) {
                 const sessionId = cookieStore.get('cf_verified')?.value;
                 let isVerified = false;
 
-                if (sessionId && process.env.UPSTASH_REDIS_REST_URL) {
-                    const redis = new Redis({
-                        url: process.env.UPSTASH_REDIS_REST_URL,
-                        token: process.env.UPSTASH_REDIS_REST_TOKEN,
-                    });
-                    const valid = await redis.get(`session:${sessionId}`);
-                    if (valid) isVerified = true;
+                if (sessionId) {
+                    const redis = getRedis();
+                    if (redis) {
+                        const valid = await redis.get(`session:${sessionId}`);
+                        if (valid) isVerified = true;
+                    }
                 }
 
                 if (!isVerified) {
                     const token = body.turnstileToken;
-                    if (!token) return new NextResponse("Turnstile token missing", { status: 403 });
+                    if (!token) return new NextResponse("Verification required. Please wait for the security check to complete.", { status: 403 });
 
                     const verifyRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
                         method: "POST",
@@ -324,17 +389,14 @@ async function handleRequest(request) {
 
                     const verifyData = await verifyRes.json();
                     if (!verifyData.success) {
-                        return new NextResponse("Invalid Turnstile token", { status: 403 });
+                        return new NextResponse("Verification failed. Please refresh the page and try again.", { status: 403 });
                     }
 
-                    // Issue a new session valid for 24 hours
+                    // Issue a new session valid for 1 hour
                     newSessionId = crypto.randomUUID();
-                    if (process.env.UPSTASH_REDIS_REST_URL) {
-                        const redis = new Redis({
-                            url: process.env.UPSTASH_REDIS_REST_URL,
-                            token: process.env.UPSTASH_REDIS_REST_TOKEN,
-                        });
-                        await redis.set(`session:${newSessionId}`, "1", { ex: 3600 * 24 });
+                    const redis = getRedis();
+                    if (redis) {
+                        await redis.set(`session:${newSessionId}`, "1", { ex: 3600 });
                     }
                 }
             }
@@ -352,14 +414,22 @@ async function handleRequest(request) {
                     (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
                     request.ip ||
                     "unknown";
-                rlResult = await ratelimit.limit(rawIp);
-                if (!rlResult.success) {
-                    return new NextResponse("Bro calm down! You can only request 5 times per minute. Tokens don't grow on trees, let everyone use it since it's a free platform! 🌴", { status: 429 });
+                if (!isLocalRequest(request)) {
+                    rlResult = await ratelimit.limit(rawIp);
+                    if (!rlResult.success) {
+                        return new NextResponse("You're sending messages too fast! Please wait a moment before trying again.", { status: 429 });
+                    }
+
+                    // 3. Daily per-IP cap
+                    const dailyCap = await checkDailyCap(rawIp);
+                    if (!dailyCap.allowed) {
+                        return new NextResponse("You've reached your daily limit. Come back tomorrow for more conversations!", { status: 429 });
+                    }
                 }
             }
 
             if (body.messages) {
-                const readableStream = await streamChatText(body.messages);
+                const { readable: readableStream } = await streamChatText(body.messages);
                 const headers = {
                     "Content-Type": "text/plain; charset=utf-8",
                     "X-Content-Type-Options": "nosniff",
@@ -367,14 +437,13 @@ async function handleRequest(request) {
                     "Transfer-Encoding": "chunked",
                 };
 
-                // Add debug headers so we can track rate limit issues in the network tab
                 if (rlResult) {
                     headers["X-RateLimit-IP"] = rawIp;
                     headers["X-RateLimit-Remaining"] = rlResult.remaining.toString();
                 }
 
                 if (newSessionId) {
-                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${3600 * 24}${isLocalRequest(request) ? '' : '; Secure'}`;
+                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${3600}${isLocalRequest(request) ? '' : '; Secure'}`;
                 }
                 return new Response(readableStream, { status: 200, headers });
             }
@@ -390,13 +459,62 @@ async function handleRequest(request) {
     const codeInput = searchParams.get('code');
     const textInput = searchParams.get('text');
 
+    // ── Input length validation for GET ──
+    const rawInput = codeInput || textInput || searchParams.get('content') || "";
+    if (rawInput.length > MAX_INPUT_CHARS) {
+        return new NextResponse("Your message is too long! Try breaking it into shorter parts.", { status: 400 });
+    }
+
+    // ── Gate GET behind the same security as POST ──
+    const needsTurnstileGet = process.env.TURNSTILE_SECRET_KEY && !isLocalRequest(request);
+    if (needsTurnstileGet) {
+        const cookieStoreGet = await cookies();
+        const sessionIdGet = cookieStoreGet.get('cf_verified')?.value;
+        let isVerifiedGet = false;
+
+        if (sessionIdGet) {
+            const redis = getRedis();
+            if (redis) {
+                const valid = await redis.get(`session:${sessionIdGet}`);
+                if (valid) isVerifiedGet = true;
+            }
+        }
+
+        if (!isVerifiedGet) {
+            return new NextResponse("Your session has expired. Please refresh the page to continue chatting.", { status: 403 });
+        }
+    }
+
+    // Rate-limit GET requests the same way as POST
+    let rlResultGet = null;
+    const ratelimitGet = getRateLimiter();
+    if (ratelimitGet && !isLocalRequest(request)) {
+        const rawIpGet =
+            request.headers.get("cf-connecting-ip") ||
+            (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
+            request.ip ||
+            "unknown";
+        rlResultGet = await ratelimitGet.limit(rawIpGet);
+        if (!rlResultGet.success) {
+            return new NextResponse("You're sending messages too fast! Please wait a moment before trying again.", { status: 429 });
+        }
+
+        // Daily per-IP cap for GET
+        const dailyCapGet = await checkDailyCap(rawIpGet);
+        if (!dailyCapGet.allowed) {
+            return new NextResponse("You've reached your daily limit. Come back tomorrow for more conversations!", { status: 429 });
+        }
+    }
+
     if (codeInput) {
         result = await generateCode(codeInput);
     } else if (textInput) {
         // Stream the text response and return it directly
-        const readable = await streamChatText(textInput);
+        const { readable } = await streamChatText(textInput);
         return new Response(readable, {
-            headers: { "Content-Type": "text/plain; charset=utf-8" }
+            headers: {
+                "Content-Type": "text/plain; charset=utf-8",
+            }
         });
     } else {
         const defaultInput = searchParams.get('content') || "Hello";
@@ -418,7 +536,13 @@ export async function GET(request) {
     } catch (e) {
         console.error('[API ERROR - GET]', e?.message || e);
         console.error(e?.stack || '');
-        return new NextResponse(`Internal error: ${e?.message || 'unknown'}`, { status: 500 });
+        if (isDailyTokenQuotaError(e)) {
+            return new NextResponse("We're a bit busy right now! Our servers have reached their daily capacity. Please try again in a little while.", { status: 429 });
+        }
+        if (isRateLimitError(e)) {
+            return new NextResponse("We're a bit busy right now! Too many people are using the service. Please try again in a moment.", { status: 429 });
+        }
+        return new NextResponse("Oops! Something unexpected happened. Please try again — if it keeps happening, try refreshing the page.", { status: 500 });
     }
 }
 
@@ -428,6 +552,12 @@ export async function POST(request) {
     } catch (e) {
         console.error('[API ERROR - POST]', e?.message || e);
         console.error(e?.stack || '');
-        return new NextResponse(`Internal error: ${e?.message || 'unknown'}`, { status: 500 });
+        if (isDailyTokenQuotaError(e)) {
+            return new NextResponse("We're a bit busy right now! Our servers have reached their daily capacity. Please try again in a little while.", { status: 429 });
+        }
+        if (isRateLimitError(e)) {
+            return new NextResponse("We're a bit busy right now! Too many people are using the service. Please try again in a moment.", { status: 429 });
+        }
+        return new NextResponse("Oops! Something unexpected happened. Please try again — if it keeps happening, try refreshing the page.", { status: 500 });
     }
 }

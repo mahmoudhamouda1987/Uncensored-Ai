@@ -86,11 +86,21 @@ export default function Home() {
       setIsResponding(true);
       setScanPhase("waiting");
 
-      // Keep only the last 12 messages to prevent exceeding token limits
-      const apiMessages = updatedMessages.slice(-12).map(msg => ({
+      // Trim conversation to fit within a token budget.
+      // Send recent messages that fit under MAX_API_CHARS total.
+      const MAX_API_CHARS = 8000;
+      const allMapped = updatedMessages.map(msg => ({
         role: msg.type === "user" ? "user" : "assistant",
         content: msg.rawText || msg.text || ""
       }));
+      let apiMessages = [];
+      let charCount = 0;
+      for (let i = allMapped.length - 1; i >= 0; i--) {
+        const msgLen = allMapped[i].content.length;
+        if (charCount + msgLen > MAX_API_CHARS) break;
+        charCount += msgLen;
+        apiMessages.unshift(allMapped[i]);
+      }
 
       // Only send turnstile token on first request; session cookie handles the rest
       const body = { messages: apiMessages };
@@ -165,10 +175,29 @@ export default function Home() {
       setIsResponding(false);
       setScanPhase("idle");
 
-      // If error.message has text from our backend, show it. Otherwise generic error.
-      const errorText = error.message && error.message.length < 300
-        ? error.message
-        : "Something went wrong. Please try again.";
+      let errorText = "Something went wrong. Please try again.";
+
+      if (error.message) {
+        const msg = error.message.toLowerCase();
+        if (msg.includes("too fast") || msg.includes("rate limit")) {
+          errorText = "Slow down! You're sending messages too fast. Wait a moment and try again.";
+        } else if (msg.includes("daily limit")) {
+          errorText = "You've hit your daily limit. Come back tomorrow for more!";
+        } else if (msg.includes("session") || msg.includes("expired") || msg.includes("refresh")) {
+          errorText = "Your session expired. Refreshing the page...";
+          setTimeout(() => window.location.reload(), 1500);
+        } else if (msg.includes("verification")) {
+          errorText = "Security check failed. Please wait a moment and try again.";
+        } else if (msg.includes("too long") || msg.includes("shorten")) {
+          errorText = "Your message is too long! Try breaking it into shorter parts.";
+        } else if (msg.includes("busy") || msg.includes("servers")) {
+          errorText = "We're a bit busy right now! Try again in a moment.";
+        } else if (msg.includes("unexpected") || msg.includes("something went wrong")) {
+          errorText = "Oops! Something unexpected happened. Try refreshing the page.";
+        } else if (error.message.length < 300) {
+          errorText = error.message;
+        }
+      }
 
       setMessages((prev) => [
         ...prev,
