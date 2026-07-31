@@ -10,17 +10,41 @@ import { Redis } from "@upstash/redis";
 // Do NOT use edge runtime here; cookies() is not supported in the Edge runtime.
 
 // =========================
-// GROQ KEY ROTATION
+// GROQ + NVIDIA KEY ROTATION
 // =========================
-function getGroqKeys() {
-    // Load GROQ_API_KEY plus any numbered keys (GROQ_API_KEY_2, _3, ...).
-    // This lets additional accounts be added through environment variables only.
-    return [...new Set(
-        Object.entries(process.env)
-            .filter(([name, value]) => /^GROQ_API_KEY(?:_\d+)?$/.test(name) && value)
-            .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
-            .map(([, value]) => value.trim())
-    )];
+
+// Provider configs: each key needs its own baseURL and model name
+const PROVIDERS = {
+    groq: {
+        baseURL: 'https://api.groq.com/openai/v1',
+        model: 'openai/gpt-oss-120b',
+    },
+    nvidia: {
+        baseURL: 'https://integrate.api.nvidia.com/v1',
+        model: 'openai/gpt-oss-120b',
+    },
+};
+
+function getAllProviderKeys() {
+    const keys = [];
+
+    // Load Groq keys: GROQ_API_KEY, GROQ_API_KEY_2, ...
+    Object.entries(process.env)
+        .filter(([name, value]) => /^GROQ_API_KEY(?:_\d+)?$/.test(name) && value)
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+        .forEach(([, value]) => {
+            keys.push({ provider: 'groq', key: value.trim() });
+        });
+
+    // Load NVIDIA keys: NVIDIA_API_KEY, NVIDIA_API_KEY_2, ...
+    Object.entries(process.env)
+        .filter(([name, value]) => /^NVIDIA_API_KEY(?:_\d+)?$/.test(name) && value && !value.includes('your-key-here'))
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+        .forEach(([, value]) => {
+            keys.push({ provider: 'nvidia', key: value.trim() });
+        });
+
+    return keys;
 }
 
 // Keep one active key for this server process. It only advances after Groq
@@ -48,11 +72,12 @@ function isDailyTokenQuotaError(e) {
 }
 
 // Use the active key until it is limited, then move forward and keep using that next key.
+// Supports mixed Groq + NVIDIA keys with automatic provider detection.
 async function groqCreateWithRotation(params) {
-    const keys = getGroqKeys();
-    if (keys.length === 0) throw new Error('No Groq API keys configured');
+    const keys = getAllProviderKeys();
+    if (keys.length === 0) throw new Error('No API keys configured');
 
-    const keySignature = keys.join('|');
+    const keySignature = keys.map(k => k.key).join('|');
     if (groqRotationState.keySignature !== keySignature) {
         groqRotationState.keySignature = keySignature;
         groqRotationState.activeIndex = 0;
@@ -62,13 +87,17 @@ async function groqCreateWithRotation(params) {
     const startingIndex = groqRotationState.activeIndex % keys.length;
     for (let offset = 0; offset < keys.length; offset += 1) {
         const i = (startingIndex + offset) % keys.length;
-        const key = keys[i];
+        const { provider, key } = keys[i];
+        const config = PROVIDERS[provider];
         // maxRetries: 0 = fail fast on 429 without retrying the same key
-        const client = new OpenAI({ apiKey: key, baseURL: 'https://api.groq.com/openai/v1', maxRetries: 0 });
+        const client = new OpenAI({ apiKey: key, baseURL: config.baseURL, maxRetries: 0 });
         try {
-            // 429 is thrown at .create() time (HTTP error before body) — even with stream:true
-            const result = await client.chat.completions.create(params);
-            return { result, keyIndex: i + 1 };
+            // Use the provider's model name, but allow params to override
+            const result = await client.chat.completions.create({
+                ...params,
+                model: config.model,
+            });
+            return { result, keyIndex: i + 1, provider };
         } catch (e) {
             if (isRateLimitError(e)) {
                 lastError = e;
@@ -211,7 +240,7 @@ Return all required files.
 // LLM CALL (CODE)
 // =========================
 async function generateCodeCompletion(messages) {
-    const { result: stream, keyIndex } = await groqCreateWithRotation({
+    const { result: stream, keyIndex, provider } = await groqCreateWithRotation({
         model: "openai/gpt-oss-120b",
         messages: messages,
         temperature: 0.2,
@@ -224,7 +253,7 @@ async function generateCodeCompletion(messages) {
     for await (const chunk of stream) {
         text += chunk.choices[0]?.delta?.content || "";
     }
-    return { text: text.trim(), keyIndex };
+    return { text: text.trim(), keyIndex, provider };
 }
 
 // =========================
@@ -279,7 +308,7 @@ Response style:
         ...conversationMessages
     ];
 
-    const { result: apiStream, keyIndex } = await groqCreateWithRotation({
+    const { result: apiStream, keyIndex, provider } = await groqCreateWithRotation({
         model: "openai/gpt-oss-120b",
         messages,
         temperature: 0.7,
@@ -302,7 +331,7 @@ Response style:
         }
     });
 
-    return { readable, keyIndex };
+    return { readable, keyIndex, provider };
 }
 
 
