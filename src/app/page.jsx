@@ -183,7 +183,7 @@ export default function Home() {
           errorText = "Slow down! You're sending messages too fast. Wait a moment and try again.";
         } else if (msg.includes("daily limit")) {
           errorText = "You've hit your daily limit. Come back tomorrow for more!";
-        } else if (msg.includes("session") || msg.includes("expired") || msg.includes("refresh")) {
+        } else if (msg.includes("session expired") || msg.includes("session has expired")) {
           errorText = "Your session expired. Refreshing the page...";
           setTimeout(() => window.location.reload(), 1500);
         } else if (msg.includes("verification")) {

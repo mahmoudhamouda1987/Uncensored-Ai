@@ -571,7 +571,7 @@ export async function GET(request) {
         if (isRateLimitError(e)) {
             return new NextResponse("We're a bit busy right now! Too many people are using the service. Please try again in a moment.", { status: 429 });
         }
-        return new NextResponse("Oops! Something unexpected happened. Please try again — if it keeps happening, try refreshing the page.", { status: 500 });
+        return new NextResponse("Something went wrong. Please try again later.", { status: 500 });
     }
 }
 
@@ -587,6 +587,6 @@ export async function POST(request) {
         if (isRateLimitError(e)) {
             return new NextResponse("We're a bit busy right now! Too many people are using the service. Please try again in a moment.", { status: 429 });
         }
-        return new NextResponse("Oops! Something unexpected happened. Please try again — if it keeps happening, try refreshing the page.", { status: 500 });
+        return new NextResponse("Something went wrong. Please try again later.", { status: 500 });
     }
 }
